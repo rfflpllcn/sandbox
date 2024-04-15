@@ -2,6 +2,7 @@ import time
 import hashlib
 import json
 import itertools
+import anyio
 
 
 class Throttler:
@@ -32,6 +33,18 @@ class BulkCovarianceCache:
         self.ttl = ttl  # Time-to-live in seconds  #TODO: not used
         self.throttler = Throttler(request_limit, time_window)
 
+    async def fetch_with_retry(self, wrapper, svc, retries=5, backoff_factor=0.3):
+        for attempt in range(retries):
+            if self.throttler.allow():
+                try:
+                    data = await wrapper.get_lower_triangular_square_covariance(svc)
+                    return data
+                except Exception as e:
+                    await anyio.sleep(backoff_factor * (2 ** attempt))  # Exponential backoff
+            else:
+                await anyio.sleep(backoff_factor * (2 ** attempt))  # Wait due to throttling
+        raise Exception("Failed to fetch data after retries")
+
     async def get_covariances(self,  wrapper, svc):
         # TODO: parametrize by KF, LF
 
@@ -55,12 +68,13 @@ class BulkCovarianceCache:
                 if key_hashed not in self.cache:  # or (now - self.cache[key_hashed]['timestamp'] > self.ttl)
                     missing_pairs.append(key_hashed)
         #NOTE: at first run (cache empty): len(missing_pairs) ==  0.5 * len(listSearchKeys) * (len(listSearchKeys) - 1) + len(listSearchKeys)
-        if missing_pairs and self.throttler.allow():
+        if missing_pairs: # and self.throttler.allow():
             missing_ts_keys = list(set(itertools.chain.from_iterable(map(lambda x: x.split("/")[0].split(":"), missing_pairs))))
             missing_ts_keys = [k for k in listSearchKeys if k in missing_ts_keys]
             svc_missing = svc.copy()
             svc_missing['listSearchKeys'] = [{'tsKey': key} for key in missing_ts_keys]
-            new_covariances = await wrapper.get_lower_triangular_square_covariance(svc_missing)
+            # new_covariances = await wrapper.get_lower_triangular_square_covariance(svc_missing)
+            new_covariances = await self.fetch_with_retry(wrapper, svc_missing)
 
             # Bulk update the cache with new covariances
             for pair in missing_pairs:
